@@ -16,10 +16,15 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "types": ["node"],
-    "ignoreDeprecations": "6.0",
     "baseUrl": ".",
-    "paths": { "@/*": ["src/*"] }
+    "paths": {
+      "@/*": ["src/*"]
+    }
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "prisma"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "prisma"
+  ]
 }
