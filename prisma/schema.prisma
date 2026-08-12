@@ -1,0 +1,292 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")   // pooled connection — used by the running app
+  directUrl  = env("DIRECT_URL")     // direct connection — used by `prisma migrate`
+  extensions = [pgvector(map: "vector")]
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+  SALES
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum DocStatus {
+  PROCESSING
+  READY
+  FAILED
+}
+
+enum FileType {
+  PDF
+  DOCX
+  PPT
+  XLSX
+  IMAGE
+  VIDEO
+  ZIP
+  OTHER
+}
+
+enum ActivityAction {
+  UPLOAD
+  DOWNLOAD
+  VIEW
+  SHARE
+  DELETE
+  LOGIN
+  AI_SEARCH
+  LINK_VIEW
+  EXPORT
+}
+
+model User {
+  id           String     @id @default(cuid())
+  fullName     String
+  username     String     @unique
+  email        String?    @unique
+  passwordHash String
+  role         Role       @default(SALES)
+  department   String?    // legacy plain text
+  departmentId String?
+  dept         Department? @relation(fields: [departmentId], references: [id])
+  status       UserStatus @default(ACTIVE)
+  avatarUrl    String?
+  storageUsed  BigInt     @default(0)
+  lastLoginAt  DateTime?
+
+  documents     Document[]        @relation("UploadedBy")
+  versions      DocumentVersion[]
+  activityLogs  ActivityLog[]
+  notifications Notification[]
+  favorites     Favorite[]
+  shares        Share[]
+  searchHistory SearchHistory[]
+  permissions   Permission[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([role])
+}
+
+model Category {
+  id          String  @id @default(cuid())
+  name        String  @unique
+  slug        String  @unique
+  color       String  @default("#2563EB")
+  icon        String?
+  description String?
+  archived    Boolean @default(false)
+  sortOrder   Int     @default(0)
+
+  documents   Document[]
+  permissions Permission[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+}
+
+model Permission {
+  id         String  @id @default(cuid())
+  userId     String
+  categoryId String
+  canView    Boolean @default(true)
+  canUpload  Boolean @default(false)
+  canDelete  Boolean @default(false)
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, categoryId])
+}
+
+model Document {
+  id            String    @id @default(cuid())
+  title         String
+  description   String?
+  keyword       String?
+  fileName      String
+  storagePath   String
+  mimeType      String
+  fileType      FileType  @default(OTHER)
+  size          BigInt
+  checksum      String
+  thumbnailUrl  String?
+  status        DocStatus @default(PROCESSING)
+  summary       String?
+  extractedText String?   @db.Text
+  version       Int       @default(1)
+  viewCount     Int       @default(0)
+  downloadCount Int       @default(0)
+
+  categoryId   String?
+  category     Category? @relation(fields: [categoryId], references: [id])
+  uploadedById String
+  uploadedBy   User      @relation("UploadedBy", fields: [uploadedById], references: [id])
+
+  versions  DocumentVersion[]
+  chunks    DocumentChunk[]
+  tags      DocumentTag[]
+  favorites Favorite[]
+  shares    Share[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([categoryId])
+  @@index([checksum])
+  @@index([status])
+}
+
+model DocumentVersion {
+  id           String   @id @default(cuid())
+  documentId   String
+  version      Int
+  storagePath  String
+  size         BigInt
+  checksum     String
+  uploadedById String
+  note         String?
+
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  uploadedBy User     @relation(fields: [uploadedById], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@unique([documentId, version])
+}
+
+model DocumentChunk {
+  id         String                      @id @default(cuid())
+  documentId String
+  content    String                      @db.Text
+  page       Int?
+  chunkIndex Int
+  embedding  Unsupported("vector(768)")?
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([documentId])
+}
+
+model Tag {
+  id        String        @id @default(cuid())
+  name      String        @unique
+  documents DocumentTag[]
+  createdAt DateTime      @default(now())
+}
+
+model DocumentTag {
+  documentId String
+  tagId      String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  tag        Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([documentId, tagId])
+}
+
+model Favorite {
+  id         String   @id @default(cuid())
+  userId     String
+  documentId String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  @@unique([userId, documentId])
+}
+
+model Share {
+  id           String    @id @default(cuid())
+  documentId   String
+  createdById  String
+  token        String    @unique @default(cuid())
+  passwordHash String?
+  expiresAt    DateTime?
+  maxViews     Int?
+  viewCount    Int       @default(0)
+  revoked      Boolean   @default(false)
+
+  document  Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  createdBy User     @relation(fields: [createdById], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([token])
+}
+
+model ActivityLog {
+  id          String         @id @default(cuid())
+  action      ActivityAction
+  userId      String?
+  actorName   String
+  targetType  String?
+  targetId    String?
+  targetTitle String?
+  meta        Json?
+  ip          String?
+
+  user User? @relation(fields: [userId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([action])
+  @@index([createdAt])
+}
+
+model Notification {
+  id     String  @id @default(cuid())
+  userId String
+  title  String
+  body   String?
+  type   String  @default("info")
+  read   Boolean @default(false)
+  link   String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, read])
+}
+
+model SearchHistory {
+  id        String   @id @default(cuid())
+  userId    String
+  query     String
+  mode      String   @default("manual")
+  results   Int      @default(0)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Department {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  color       String   @default("#2563EB")
+  users       User[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
