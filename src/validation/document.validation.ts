@@ -4,12 +4,14 @@ export const uploadDocumentSchema = z.object({
   title: z.string().min(1, "Title is required"),
   keyword: z.string().optional().or(z.literal("")).transform((v) => v || undefined),
   categoryId: z.string().optional().or(z.literal("")).transform((v) => v || undefined),
+  folderId: z.string().optional().or(z.literal("")).transform((v) => v || undefined),
   description: z.string().optional().or(z.literal("")).transform((v) => v || undefined),
 })
 
 export const listDocumentsSchema = z.object({
   q: z.string().optional(),
   categoryId: z.string().optional(),
+  folderId: z.string().optional(),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(24),
 })
