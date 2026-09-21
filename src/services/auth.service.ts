@@ -41,29 +41,46 @@ const sign = (userId: string, role: string) =>
     { expiresIn: env.jwtExpiresIn } as jwt.SignOptions,
   )
 
+const timed = async <T>(
+  name: string,
+  fn: () => Promise<T>,
+): Promise<T> => {
+  const start = Date.now()
+
+  try {
+    return await fn()
+  } finally {
+    console.log(`[Auth] ${name}: ${Date.now() - start}ms`)
+  }
+}
+
 export const authService = {
   async login(input: LoginInput, ip?: string) {
-    const user = await prisma.user.findFirst({
-      where: {
-        username: input.username,
-        deletedAt: null,
-      },
-      select: {
-        id: true,
-        fullName: true,
-        username: true,
-        email: true,
-        passwordHash: true,
-        role: true,
-        department: true,
-        status: true,
-        avatarUrl: true,
-        storageUsed: true,
-        lastLoginAt: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-    })
+    const totalStart = Date.now()
+
+    const user = await timed("user lookup", () =>
+      prisma.user.findFirst({
+        where: {
+          username: input.username,
+          deletedAt: null,
+        },
+        select: {
+          id: true,
+          fullName: true,
+          username: true,
+          email: true,
+          passwordHash: true,
+          role: true,
+          department: true,
+          status: true,
+          avatarUrl: true,
+          storageUsed: true,
+          lastLoginAt: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+      }),
+    )
 
     if (!user) {
       throw ApiError.unauthorized("Invalid username or password")
@@ -73,20 +90,23 @@ export const authService = {
       throw ApiError.forbidden("This account has been disabled")
     }
 
-    const valid = await bcrypt.compare(input.password, user.passwordHash)
+    const valid = await timed(
+      "bcrypt",
+      () => bcrypt.compare(input.password, user.passwordHash),
+    )
 
     if (!valid) {
       throw ApiError.unauthorized("Invalid username or password")
     }
 
-    // These are not required to authenticate the user.
-    // Don't make the user wait for them.
-    void prisma.user.update({
-      where: { id: user.id },
-      data: { lastLoginAt: new Date() },
-    }).catch((err) => {
-      console.error("[auth] lastLoginAt update failed", err)
-    })
+    void prisma.user
+      .update({
+        where: { id: user.id },
+        data: { lastLoginAt: new Date() },
+      })
+      .catch((err) => {
+        console.error("[auth] lastLoginAt update failed", err)
+      })
 
     void activityService.log({
       action: "LOGIN",
@@ -95,8 +115,12 @@ export const authService = {
       ip,
     })
 
+    const accessToken = sign(user.id, user.role)
+
+    console.log(`[Auth] login total: ${Date.now() - totalStart}ms`)
+
     return {
-      accessToken: sign(user.id, user.role),
+      accessToken,
       user: publicUser(user),
     }
   },
