@@ -1,4 +1,6 @@
+
 import { createClient, type SupabaseClient } from "@supabase/supabase-js"
+import { Readable } from "node:stream"
 import { env } from "../config/env.js"
 import { ApiError } from "../utils/ApiError.js"
 
@@ -107,6 +109,23 @@ export const storage = {
     }
 
     return Buffer.from(await data.arrayBuffer())
+  },
+
+  /**
+   * Download an object as a stream for memory-efficient ZIP exports.
+   * This avoids buffering the entire file in application memory.
+   */
+  async downloadStream(path: string): Promise<Readable> {
+    const url = await this.signedUrl(path, 60 * 5)
+    const response = await fetch(url)
+
+    if (!response.ok || !response.body) {
+      throw ApiError.internal(
+        `Storage streaming download failed: HTTP ${response.status}`
+      )
+    }
+
+    return Readable.fromWeb(response.body as any)
   },
 
   /** Remove objects from Supabase Storage. */

@@ -1,3 +1,4 @@
+
 import crypto from "crypto"
 import bcrypt from "bcryptjs"
 import { prisma } from "../config/prisma.js"
@@ -7,7 +8,10 @@ import { resolveFileType } from "../utils/fileType.js"
 import { activityService } from "./activity.service.js"
 import { processDocument } from "../ai/pipeline.js"
 import type { Role } from "@prisma/client"
-import type { UploadDocumentInput, ListDocumentsInput } from "../validation/document.validation.js"
+import type {
+  UploadDocumentInput,
+  ListDocumentsInput,
+} from "../validation/document.validation.js"
 
 const docInclude = {
   category: true,
@@ -16,12 +20,17 @@ const docInclude = {
 } as const
 
 /** Categories a SALES user is allowed to see. ADMIN/MANAGER see all. */
-async function visibleCategoryIds(userId: string, role: Role): Promise<string[] | null> {
-  if (role === "ADMIN" || role === "MANAGER") return null // null = no restriction
+async function visibleCategoryIds(
+  userId: string,
+  role: Role,
+): Promise<string[] | null> {
+  if (role === "ADMIN" || role === "MANAGER") return null
+
   const perms = await prisma.permission.findMany({
     where: { userId, canView: true },
     select: { categoryId: true },
   })
+
   return perms.map((p) => p.categoryId)
 }
 
@@ -34,7 +43,11 @@ function shapeDoc(d: any) {
 }
 
 export const documentService = {
-  async list(userId: string, role: Role, params: ListDocumentsInput) {
+  async list(
+    userId: string,
+    role: Role,
+    params: ListDocumentsInput,
+  ) {
     const {
       q,
       categoryId,
@@ -57,7 +70,6 @@ export const documentService = {
 
     if (categoryId) where.categoryId = categoryId
 
-    // Folder filtering
     if (folderId) where.folderId = folderId
 
     if (tagId) {
@@ -70,14 +82,70 @@ export const documentService = {
       }
     }
 
-    if (q) {
-      where.OR = [
-        { title: { contains: q, mode: "insensitive" } },
-        { keyword: { contains: q, mode: "insensitive" } },
-        { fileName: { contains: q, mode: "insensitive" } },
-        { description: { contains: q, mode: "insensitive" } },
-      ]
-    }
+    
+if (q?.trim()) {
+  const normalizeSearch = (value: string) =>
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim()
+      .replace(/\s+/g, " ")
+
+  const searchTerms = normalizeSearch(q)
+    .split(" ")
+    .filter(Boolean)
+
+  const compactQuery = normalizeSearch(q).replace(/\s+/g, "")
+
+  const documents = await prisma.document.findMany({
+    where: {
+      ...where,
+    },
+    include: docInclude,
+    orderBy: { createdAt: "desc" },
+  })
+
+  const matchedDocuments = documents.filter((doc) => {
+    const searchableText = [
+      doc.title,
+      doc.fileName,
+      doc.keyword,
+      doc.description,
+    ]
+      .filter(Boolean)
+      .map((value) => normalizeSearch(String(value)))
+
+    const compactFields = searchableText.map((value) =>
+      value.replace(/\s+/g, ""),
+    )
+
+    const allTermsMatch =
+      searchTerms.length > 0 &&
+      searchTerms.every((term) =>
+        searchableText.some((value) => value.includes(term)),
+      )
+
+    const compactMatch =
+      compactQuery.length > 0 &&
+      compactFields.some((value) => value.includes(compactQuery))
+
+    return allTermsMatch || compactMatch
+  })
+
+  const total = matchedDocuments.length
+  const items = matchedDocuments.slice(
+    (page - 1) * pageSize,
+    page * pageSize,
+  )
+
+  return {
+    items: items.map(shapeDoc),
+    total,
+    page,
+    pageSize,
+  }
+}
+
 
     const [items, total] = await Promise.all([
       prisma.document.findMany({
@@ -110,7 +178,6 @@ export const documentService = {
       )
     }
 
-    // Duplicate detection via SHA-256 checksum
     const checksum = crypto
       .createHash("sha256")
       .update(file.buffer)
@@ -135,7 +202,10 @@ export const documentService = {
     }
 
     const fileType = resolveFileType(file.mimetype)
-    const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_")
+    const safeName = file.originalname.replace(
+      /[^a-zA-Z0-9._-]/g,
+      "_",
+    )
     const storagePath = `${actor.id}/${Date.now()}-${safeName}`
 
     await storage.upload(
@@ -156,23 +226,15 @@ export const documentService = {
         size: BigInt(file.size),
         checksum,
         status: "PROCESSING",
-
         categoryId: input.categoryId,
-
-        // Save the folder
         folderId: input.folderId,
-
         uploadedById: actor.id,
       },
-
       include: docInclude,
     })
 
-    // Track storage used by the uploader
     await prisma.user.update({
-      where: {
-        id: actor.id,
-      },
+      where: { id: actor.id },
       data: {
         storageUsed: {
           increment: BigInt(file.size),
@@ -189,7 +251,6 @@ export const documentService = {
       targetTitle: doc.title,
     })
 
-    // Notify the uploader that the document is being processed
     await prisma.notification
       .create({
         data: {
@@ -202,13 +263,12 @@ export const documentService = {
       })
       .catch(() => {})
 
-    // Kick off AI processing in the background
     void processDocument(doc.id)
 
     return shapeDoc(doc)
   },
 
-  /** Upload many files at once. Each becomes its own document (title = filename). */
+  /** Upload many files at once. Each becomes its own document. */
   async bulkUpload(
     files: Express.Multer.File[],
     input: {
@@ -239,9 +299,7 @@ export const documentService = {
             checksum,
             deletedAt: null,
           },
-          select: {
-            id: true,
-          },
+          select: { id: true },
         })
 
         if (duplicate) {
@@ -257,7 +315,6 @@ export const documentService = {
           /[^a-zA-Z0-9._-]/g,
           "_",
         )
-
         const storagePath = `${actor.id}/${Date.now()}-${safeName}`
 
         await storage.upload(
@@ -278,20 +335,14 @@ export const documentService = {
             size: BigInt(file.size),
             checksum,
             status: "PROCESSING",
-
             categoryId: input.categoryId,
-
-            // Save the folder
             folderId: input.folderId,
-
             uploadedById: actor.id,
           },
         })
 
         await prisma.user.update({
-          where: {
-            id: actor.id,
-          },
+          where: { id: actor.id },
           data: {
             storageUsed: {
               increment: BigInt(file.size),
@@ -352,6 +403,158 @@ export const documentService = {
     }
   },
 
+  /**
+   * Return active PDFs for an Admin category ZIP export.
+   * Only documents belonging to the selected category are included.
+   * Folder paths are preserved when the folder tree has a root folder
+   * matching the category name. Documents elsewhere remain at ZIP root.
+   * The HTTP route must enforce authorize("ADMIN").
+   */
+  async getCategoryZipData(categoryId: string) {
+    const category = await prisma.category.findUnique({
+      where: { id: categoryId },
+      select: {
+        id: true,
+        name: true,
+      },
+    })
+
+    if (!category) {
+      throw ApiError.notFound("Category not found")
+    }
+
+    const folders = await prisma.folder.findMany({
+      where: { deletedAt: null },
+      select: {
+        id: true,
+        name: true,
+        parentId: true,
+      },
+    })
+
+    const folderById = new Map(
+      folders.map((folder) => [folder.id, folder]),
+    )
+
+    const folderPaths = new Map<string, string>()
+
+    const getFolderPath = (
+      folderId: string,
+      visited = new Set<string>(),
+    ): string => {
+      const cached = folderPaths.get(folderId)
+      if (cached !== undefined) return cached
+
+      if (visited.has(folderId)) return ""
+
+      const folder = folderById.get(folderId)
+      if (!folder) return ""
+
+      visited.add(folderId)
+
+      const parentPath = folder.parentId
+        ? getFolderPath(folder.parentId, visited)
+        : ""
+
+      visited.delete(folderId)
+
+      const path = parentPath
+        ? `${parentPath}/${folder.name}`
+        : folder.name
+
+      folderPaths.set(folderId, path)
+      return path
+    }
+
+    const rootFolderIds = new Set(
+      folders
+        .filter(
+          (folder) =>
+            folder.parentId === null &&
+            folder.name.toLowerCase() === category.name.toLowerCase(),
+        )
+        .map((folder) => folder.id),
+    )
+
+    const categoryFolderIds = new Set<string>()
+
+    for (const folder of folders) {
+      let current: (typeof folder) | undefined = folder
+      const visited = new Set<string>()
+
+      while (current) {
+        if (visited.has(current.id)) break
+        visited.add(current.id)
+
+        if (rootFolderIds.has(current.id)) {
+          categoryFolderIds.add(folder.id)
+          break
+        }
+
+        current = current.parentId
+          ? folderById.get(current.parentId)
+          : undefined
+      }
+    }
+
+    const documents = await prisma.document.findMany({
+      where: {
+        categoryId: category.id,
+        deletedAt: null,
+        OR: [
+          {
+            mimeType: {
+              equals: "application/pdf",
+              mode: "insensitive",
+            },
+          },
+          {
+            fileName: {
+              endsWith: ".pdf",
+              mode: "insensitive",
+            },
+          },
+        ],
+      },
+      select: {
+        id: true,
+        title: true,
+        fileName: true,
+        storagePath: true,
+        folderId: true,
+        createdAt: true,
+      },
+      orderBy: {
+        createdAt: "asc",
+      },
+    })
+
+    if (documents.length === 0) {
+      throw ApiError.notFound(
+        "No active PDF documents found in this category",
+      )
+    }
+
+    const uniqueDocuments = new Map(
+      documents.map((document) => [
+        document.id,
+        {
+          ...document,
+          folderPath:
+            document.folderId &&
+            categoryFolderIds.has(document.folderId)
+              ? getFolderPath(document.folderId)
+              : "",
+        },
+      ]),
+    )
+
+    return {
+      categoryName: category.name,
+      documents: Array.from(uniqueDocuments.values()),
+    }
+  },
+
   async getDownloadUrl(
     id: string,
     userId: string,
@@ -371,10 +574,7 @@ export const documentService = {
       throw ApiError.notFound("Document not found")
     }
 
-    const allowed = await visibleCategoryIds(
-      userId,
-      role,
-    )
+    const allowed = await visibleCategoryIds(userId, role)
 
     if (
       allowed !== null &&
@@ -389,16 +589,12 @@ export const documentService = {
     const url = await storage.signedUrl(
       doc.storagePath,
       60 * 60,
-      forceDownload
-        ? doc.fileName
-        : undefined,
+      forceDownload ? doc.fileName : undefined,
     )
 
     if (forceDownload) {
       await prisma.document.update({
-        where: {
-          id,
-        },
+        where: { id },
         data: {
           downloadCount: {
             increment: 1,
@@ -438,9 +634,7 @@ export const documentService = {
     }
 
     await prisma.document.update({
-      where: {
-        id,
-      },
+      where: { id },
       data: {
         deletedAt: new Date(),
       },
@@ -448,9 +642,7 @@ export const documentService = {
 
     await prisma.user
       .update({
-        where: {
-          id: doc.uploadedById,
-        },
+        where: { id: doc.uploadedById },
         data: {
           storageUsed: {
             decrement: doc.size,
@@ -499,8 +691,7 @@ export const documentService = {
 
     const expiresAt = input.expiresInHours
       ? new Date(
-          Date.now() +
-            input.expiresInHours * 3600 * 1000,
+          Date.now() + input.expiresInHours * 3600 * 1000,
         )
       : undefined
 
@@ -556,7 +747,6 @@ export const documentService = {
       throw ApiError.notFound("Document not found")
     }
 
-    // Use raw SQL since Prisma client may not have isPinned yet
     const current =
       await prisma.$queryRawUnsafe<{ isPinned: boolean }[]>(
         `SELECT "isPinned" FROM "Document" WHERE id = $1`,
@@ -593,9 +783,7 @@ export const documentService = {
     }
 
     await prisma.document.update({
-      where: {
-        id,
-      },
+      where: { id },
       data: {
         status: "PROCESSING",
       },
