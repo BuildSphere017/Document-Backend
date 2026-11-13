@@ -42,6 +42,116 @@ function shapeDoc(d: any) {
   }
 }
 
+/**
+ * Finds the most recent active document whose file name matches the
+ * uploaded file (case-insensitive). This is the identity used for
+ * automatic version replacement: re-uploading a file with the same
+ * name updates the existing document in place instead of creating a
+ * new one.
+ */
+function findByFileName(fileName: string) {
+  return prisma.document.findFirst({
+    where: {
+      deletedAt: null,
+      fileName: { equals: fileName, mode: "insensitive" },
+    },
+    orderBy: { createdAt: "desc" },
+  })
+}
+
+/**
+ * Replace an existing document's file with a newer upload, preserving
+ * the previous file as version history. The document keeps its id,
+ * category and folder — only its stored file, checksum and version
+ * number change. The old file is archived into DocumentVersion so it
+ * stays downloadable, and the AI pipeline re-runs on the new content.
+ */
+async function createNewVersion(
+  existing: {
+    id: string
+    title: string
+    version: number
+    storagePath: string
+    size: bigint
+    checksum: string
+    uploadedById: string
+  },
+  file: Express.Multer.File,
+  checksum: string,
+  actor: { id: string; fullName: string },
+  note?: string,
+) {
+  const fileType = resolveFileType(file.mimetype)
+  const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_")
+  const storagePath = `${actor.id}/${Date.now()}-${safeName}`
+
+  // Upload the new file first; if this fails nothing in the DB changes.
+  await storage.upload(storagePath, file.buffer, file.mimetype)
+
+  // Archive the current file and promote the new one atomically.
+  const [, updated] = await prisma.$transaction([
+    prisma.documentVersion.create({
+      data: {
+        documentId: existing.id,
+        version: existing.version,
+        storagePath: existing.storagePath,
+        size: existing.size,
+        checksum: existing.checksum,
+        uploadedById: existing.uploadedById,
+        note: note ?? null,
+      },
+    }),
+    prisma.document.update({
+      where: { id: existing.id },
+      data: {
+        fileName: file.originalname,
+        storagePath,
+        mimeType: file.mimetype,
+        fileType,
+        size: BigInt(file.size),
+        checksum,
+        version: { increment: 1 },
+        status: "PROCESSING",
+      },
+      include: docInclude,
+    }),
+  ])
+
+  await prisma.user
+    .update({
+      where: { id: actor.id },
+      data: { storageUsed: { increment: BigInt(file.size) } },
+    })
+    .catch(() => {})
+
+  await activityService.log({
+    action: "UPLOAD",
+    actorName: actor.fullName,
+    userId: actor.id,
+    targetType: "document",
+    targetId: existing.id,
+    targetTitle: updated.title,
+    meta: { versioned: true, version: updated.version },
+  })
+
+  await prisma.notification
+    .create({
+      data: {
+        userId: actor.id,
+        title: "New version uploaded",
+        body: `"${updated.title}" was updated to version ${updated.version}. The previous version was saved to history.`,
+        type: "upload",
+        link: "/documents",
+      },
+    })
+    .catch(() => {})
+
+  // Re-extract, re-chunk and re-embed the new content for AI search.
+  void processDocument(existing.id)
+
+  return shapeDoc(updated)
+}
+
 export const documentService = {
   async list(
     userId: string,
@@ -83,66 +193,43 @@ export const documentService = {
     }
 
     
+// Text search is pushed down to Postgres so only the current page
+// is read, not the whole table. Each search term must appear in at
+// least one of title / fileName / keyword / description (case
+// insensitive); all terms must match (AND of per-term OR). Also
+// matches the raw query as typed, so a multi-word phrase still works.
 if (q?.trim()) {
-  const normalizeSearch = (value: string) =>
-    value
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, " ")
-      .trim()
-      .replace(/\s+/g, " ")
+  const raw = q.trim()
 
-  const searchTerms = normalizeSearch(q)
-    .split(" ")
+  const terms = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
     .filter(Boolean)
 
-  const compactQuery = normalizeSearch(q).replace(/\s+/g, "")
-
-  const documents = await prisma.document.findMany({
-    where: {
-      ...where,
-    },
-    include: docInclude,
-    orderBy: { createdAt: "desc" },
+  const fieldsContain = (needle: string) => ({
+    OR: [
+      { title: { contains: needle, mode: "insensitive" as const } },
+      { fileName: { contains: needle, mode: "insensitive" as const } },
+      { keyword: { contains: needle, mode: "insensitive" as const } },
+      { description: { contains: needle, mode: "insensitive" as const } },
+    ],
   })
 
-  const matchedDocuments = documents.filter((doc) => {
-    const searchableText = [
-      doc.title,
-      doc.fileName,
-      doc.keyword,
-      doc.description,
+  // Match when EITHER every term appears somewhere, OR the whole
+  // query (as typed) appears in a single field.
+  if (terms.length) {
+    where.AND = [
+      {
+        OR: [
+          { AND: terms.map(fieldsContain) },
+          fieldsContain(raw),
+        ],
+      },
     ]
-      .filter(Boolean)
-      .map((value) => normalizeSearch(String(value)))
-
-    const compactFields = searchableText.map((value) =>
-      value.replace(/\s+/g, ""),
-    )
-
-    const allTermsMatch =
-      searchTerms.length > 0 &&
-      searchTerms.every((term) =>
-        searchableText.some((value) => value.includes(term)),
-      )
-
-    const compactMatch =
-      compactQuery.length > 0 &&
-      compactFields.some((value) => value.includes(compactQuery))
-
-    return allTermsMatch || compactMatch
-  })
-
-  const total = matchedDocuments.length
-  const items = matchedDocuments.slice(
-    (page - 1) * pageSize,
-    page * pageSize,
-  )
-
-  return {
-    items: items.map(shapeDoc),
-    total,
-    page,
-    pageSize,
+  } else {
+    where.AND = [fieldsContain(raw)]
   }
 }
 
@@ -183,6 +270,32 @@ if (q?.trim()) {
       .update(file.buffer)
       .digest("hex")
 
+    // Automatic version replacement: if a document with the same file
+    // name already exists, update it in place (keeping its folder and
+    // category) and archive the old file as version history — unless the
+    // bytes are identical, in which case there is nothing to update.
+    const existingByName = await findByFileName(file.originalname)
+
+    if (existingByName) {
+      if (existingByName.checksum === checksum) {
+        throw ApiError.conflict(
+          `"${existingByName.title}" already contains this exact file — no changes detected.`,
+          { documentId: existingByName.id, unchanged: true },
+        )
+      }
+
+      const updated = await createNewVersion(
+        existingByName,
+        file,
+        checksum,
+        actor,
+      )
+
+      return Object.assign(updated, { action: "versioned" as const })
+    }
+
+    // No name match — guard against the same bytes uploaded under a
+    // different name (a true duplicate).
     const duplicate = await prisma.document.findFirst({
       where: {
         checksum,
@@ -283,8 +396,9 @@ if (q?.trim()) {
 
     const results: {
       fileName: string
-      status: "uploaded" | "duplicate" | "failed"
+      status: "uploaded" | "versioned" | "duplicate" | "failed"
       title?: string
+      version?: number
     }[] = []
 
     for (const file of files) {
@@ -293,6 +407,35 @@ if (q?.trim()) {
           .createHash("sha256")
           .update(file.buffer)
           .digest("hex")
+
+        // Same file name → replace in place as a new version (unless the
+        // bytes are unchanged). Keeps the document in its existing folder.
+        const existingByName = await findByFileName(file.originalname)
+
+        if (existingByName) {
+          if (existingByName.checksum === checksum) {
+            results.push({
+              fileName: file.originalname,
+              status: "duplicate",
+            })
+            continue
+          }
+
+          const updated = await createNewVersion(
+            existingByName,
+            file,
+            checksum,
+            actor,
+          )
+
+          results.push({
+            fileName: file.originalname,
+            status: "versioned",
+            title: updated.title,
+            version: updated.version,
+          })
+          continue
+        }
 
         const duplicate = await prisma.document.findFirst({
           where: {
@@ -383,13 +526,21 @@ if (q?.trim()) {
       (r) => r.status === "uploaded",
     ).length
 
-    if (uploaded > 0) {
+    const versioned = results.filter(
+      (r) => r.status === "versioned",
+    ).length
+
+    if (uploaded > 0 || versioned > 0) {
+      const parts: string[] = []
+      if (uploaded > 0) parts.push(`${uploaded} new`)
+      if (versioned > 0) parts.push(`${versioned} updated to a new version`)
+
       await prisma.notification
         .create({
           data: {
             userId: actor.id,
             title: "Bulk upload complete",
-            body: `${uploaded} of ${files.length} document(s) uploaded and processing.`,
+            body: `${parts.join(" · ")} (of ${files.length} file(s)) — processing for AI search.`,
             type: "upload",
             link: "/documents",
           },
@@ -672,7 +823,7 @@ if (q?.trim()) {
       expiresInHours?: number
       maxViews?: number
     },
-    actor: { id: string; fullName: string },
+    actor: { id: string; fullName: string; role: Role },
   ) {
     const doc = await prisma.document.findFirst({
       where: {
@@ -683,6 +834,19 @@ if (q?.trim()) {
 
     if (!doc) {
       throw ApiError.notFound("Document not found")
+    }
+
+    // A user may only share a document they are allowed to view.
+    const allowed = await visibleCategoryIds(actor.id, actor.role)
+
+    if (
+      allowed !== null &&
+      doc.categoryId &&
+      !allowed.includes(doc.categoryId)
+    ) {
+      throw ApiError.forbidden(
+        "You don't have access to this document",
+      )
     }
 
     const passwordHash = input.password
@@ -806,5 +970,227 @@ if (q?.trim()) {
     return {
       success: true,
     }
+  },
+
+  /**
+   * List the version history of a document: the current (live) version
+   * plus every archived previous version, newest first. Enforces the
+   * same category-level view permission as download.
+   */
+  async listVersions(id: string, userId: string, role: Role) {
+    const doc = await prisma.document.findFirst({
+      where: { id, deletedAt: null },
+      select: {
+        id: true,
+        title: true,
+        fileName: true,
+        size: true,
+        version: true,
+        categoryId: true,
+        updatedAt: true,
+      },
+    })
+
+    if (!doc) {
+      throw ApiError.notFound("Document not found")
+    }
+
+    const allowed = await visibleCategoryIds(userId, role)
+
+    if (
+      allowed !== null &&
+      doc.categoryId &&
+      !allowed.includes(doc.categoryId)
+    ) {
+      throw ApiError.forbidden("You don't have access to this document")
+    }
+
+    const history = await prisma.documentVersion.findMany({
+      where: { documentId: id },
+      orderBy: { version: "desc" },
+      include: {
+        uploadedBy: { select: { id: true, fullName: true } },
+      },
+    })
+
+    return {
+      documentId: doc.id,
+      title: doc.title,
+      current: {
+        version: doc.version,
+        fileName: doc.fileName,
+        size: Number(doc.size),
+        createdAt: doc.updatedAt,
+        isCurrent: true,
+      },
+      history: history.map((v) => ({
+        version: v.version,
+        size: Number(v.size),
+        note: v.note,
+        uploadedBy: v.uploadedBy?.fullName ?? null,
+        createdAt: v.createdAt,
+        isCurrent: false,
+      })),
+    }
+  },
+
+  /**
+   * Build a signed URL for a specific version of a document. The current
+   * version resolves to the live file; older versions resolve to their
+   * archived copy. Enforces the same category-level view permission.
+   */
+  async getVersionDownloadUrl(
+    id: string,
+    version: number,
+    userId: string,
+    role: Role,
+    actorName: string,
+  ) {
+    const doc = await prisma.document.findFirst({
+      where: { id, deletedAt: null },
+      select: {
+        id: true,
+        title: true,
+        fileName: true,
+        version: true,
+        storagePath: true,
+        categoryId: true,
+      },
+    })
+
+    if (!doc) {
+      throw ApiError.notFound("Document not found")
+    }
+
+    const allowed = await visibleCategoryIds(userId, role)
+
+    if (
+      allowed !== null &&
+      doc.categoryId &&
+      !allowed.includes(doc.categoryId)
+    ) {
+      throw ApiError.forbidden("You don't have access to this document")
+    }
+
+    let storagePath = doc.storagePath
+
+    if (version !== doc.version) {
+      const archived = await prisma.documentVersion.findFirst({
+        where: { documentId: id, version },
+        select: { storagePath: true },
+      })
+
+      if (!archived) {
+        throw ApiError.notFound("That version was not found")
+      }
+
+      storagePath = archived.storagePath
+    }
+
+    const dotIndex = doc.fileName.lastIndexOf(".")
+    const stem =
+      dotIndex > 0 ? doc.fileName.slice(0, dotIndex) : doc.fileName
+    const ext = dotIndex > 0 ? doc.fileName.slice(dotIndex) : ""
+    const downloadName = `${stem} (v${version})${ext}`
+
+    const url = await storage.signedUrl(storagePath, 60 * 60, downloadName)
+
+    await activityService.log({
+      action: "DOWNLOAD",
+      actorName,
+      userId,
+      targetType: "document",
+      targetId: doc.id,
+      targetTitle: doc.title,
+      meta: { version },
+    })
+
+    return { url, fileName: downloadName, version }
+  },
+
+  /**
+   * Restore an older version as the current file. This is
+   * non-destructive: the current file is first archived to history,
+   * then a new version is created whose content equals the chosen old
+   * version. The document keeps its id, folder and category. The AI
+   * pipeline re-runs so search reflects the restored content.
+   */
+  async revertToVersion(
+    id: string,
+    version: number,
+    actor: { id: string; fullName: string },
+  ) {
+    const doc = await prisma.document.findFirst({
+      where: { id, deletedAt: null },
+    })
+
+    if (!doc) {
+      throw ApiError.notFound("Document not found")
+    }
+
+    if (version === doc.version) {
+      throw ApiError.badRequest("That version is already the current one")
+    }
+
+    const target = await prisma.documentVersion.findFirst({
+      where: { documentId: id, version },
+    })
+
+    if (!target) {
+      throw ApiError.notFound("That version was not found")
+    }
+
+    const [, updated] = await prisma.$transaction([
+      // Archive the current live file so nothing is lost.
+      prisma.documentVersion.create({
+        data: {
+          documentId: doc.id,
+          version: doc.version,
+          storagePath: doc.storagePath,
+          size: doc.size,
+          checksum: doc.checksum,
+          uploadedById: doc.uploadedById,
+          note: `Replaced by revert to v${version}`,
+        },
+      }),
+      // Promote the chosen version's file to current.
+      prisma.document.update({
+        where: { id: doc.id },
+        data: {
+          storagePath: target.storagePath,
+          size: target.size,
+          checksum: target.checksum,
+          version: { increment: 1 },
+          status: "PROCESSING",
+        },
+        include: docInclude,
+      }),
+    ])
+
+    await activityService.log({
+      action: "UPLOAD",
+      actorName: actor.fullName,
+      userId: actor.id,
+      targetType: "document",
+      targetId: doc.id,
+      targetTitle: updated.title,
+      meta: { reverted: true, from: version, to: updated.version },
+    })
+
+    await prisma.notification
+      .create({
+        data: {
+          userId: actor.id,
+          title: "Version restored",
+          body: `"${updated.title}" was restored from version ${version} (now version ${updated.version}).`,
+          type: "info",
+          link: "/documents",
+        },
+      })
+      .catch(() => {})
+
+    void processDocument(doc.id)
+
+    return shapeDoc(updated)
   },
 }

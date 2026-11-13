@@ -230,6 +230,7 @@ export const documentController = {
       {
         id: req.user!.id,
         fullName: req.user!.fullName,
+        role: req.user!.role,
       },
     )
 
@@ -241,6 +242,53 @@ export const documentController = {
       id: req.user!.id,
       fullName: req.user!.fullName,
     })
+
+    res.json(serialize(data))
+  },
+
+  async listVersions(req: Request, res: Response) {
+    const data = await documentService.listVersions(
+      req.params.id,
+      req.user!.id,
+      req.user!.role,
+    )
+
+    res.json(serialize(data))
+  },
+
+  async downloadVersion(req: Request, res: Response) {
+    const version = Number(req.params.version)
+
+    if (!Number.isInteger(version) || version < 1) {
+      throw ApiError.badRequest("Invalid version number")
+    }
+
+    const data = await documentService.getVersionDownloadUrl(
+      req.params.id,
+      version,
+      req.user!.id,
+      req.user!.role,
+      req.user!.fullName,
+    )
+
+    res.json(serialize(data))
+  },
+
+  async revertVersion(req: Request, res: Response) {
+    const version = Number(req.params.version)
+
+    if (!Number.isInteger(version) || version < 1) {
+      throw ApiError.badRequest("Invalid version number")
+    }
+
+    const data = await documentService.revertToVersion(
+      req.params.id,
+      version,
+      {
+        id: req.user!.id,
+        fullName: req.user!.fullName,
+      },
+    )
 
     res.json(serialize(data))
   },

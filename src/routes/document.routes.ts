@@ -45,6 +45,24 @@ router.post(
   asyncHandler(documentController.share),
 )
 
+// Version history — any user with view access to the document
+router.get(
+  "/:id/versions",
+  asyncHandler(documentController.listVersions),
+)
+
+router.get(
+  "/:id/versions/:version/download",
+  asyncHandler(documentController.downloadVersion),
+)
+
+// Restore an older version as the current file — ADMIN only
+router.post(
+  "/:id/versions/:version/revert",
+  authorize("ADMIN"),
+  asyncHandler(documentController.revertVersion),
+)
+
 // ADMIN + CRM department: upload
 router.post(
   "/",
